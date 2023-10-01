@@ -326,7 +326,7 @@ M.open_float = function(dir)
       if config.adapters[scheme] == "files" then
         assert(path)
         local fs = require("fm.fs")
-        title = " File Manager - "..vim.fn.fnamemodify(fs.posix_to_os_path(path), ":~").." " 
+        title = "  File Manager - "..vim.fn.fnamemodify(fs.posix_to_os_path(path), ":~").." " 
       end
       return title
     end
@@ -717,7 +717,7 @@ local function set_colors()
     vim.api.nvim_set_hl(
       0,
       "FloatTitle",
-      { fg = normal.foreground, bg = border.background or normal.background }
+      { fg = "#CDD6F4", bg = border.background or normal.background }
     )
   end
 end
