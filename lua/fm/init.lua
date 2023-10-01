@@ -326,7 +326,7 @@ M.open_float = function(dir)
       if config.adapters[scheme] == "files" then
         assert(path)
         local fs = require("fm.fs")
-        title = vim.fn.fnamemodify(fs.posix_to_os_path(path), ":~")
+        title = "FM - "..vim.fn.fnamemodify(fs.posix_to_os_path(path), ":~") 
       end
       return title
     end
