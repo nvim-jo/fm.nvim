@@ -1,0 +1,661 @@
+local cache = require("fm.cache")
+local columns = require("fm.columns")
+local config = require("fm.config")
+local constants = require("fm.constants")
+local keymap_util = require("fm.keymap_util")
+local loading = require("fm.loading")
+local util = require("fm.util")
+local M = {}
+
+local FIELD_ID = constants.FIELD_ID
+local FIELD_NAME = constants.FIELD_NAME
+local FIELD_TYPE = constants.FIELD_TYPE
+local FIELD_META = constants.FIELD_META
+
+-- map of path->last entry under cursor
+local last_cursor_entry = {}
+
+---@param entry fm.InternalEntry
+---@param bufnr integer
+---@return boolean
+M.should_display = function(entry, bufnr)
+  local name = entry[FIELD_NAME]
+  return not config.view_options.is_always_hidden(name, bufnr)
+    and (not config.view_options.is_hidden_file(name, bufnr) or config.view_options.show_hidden)
+end
+
+---@param bufname string
+---@param name nil|string
+M.set_last_cursor = function(bufname, name)
+  last_cursor_entry[bufname] = name
+end
+
+---Set the cursor to the last_cursor_entry if one exists
+M.maybe_set_cursor = function()
+  local fm = require("fm")
+  local bufname = vim.api.nvim_buf_get_name(0)
+  local entry_name = last_cursor_entry[bufname]
+  if not entry_name then
+    return
+  end
+  local line_count = vim.api.nvim_buf_line_count(0)
+  for lnum = 1, line_count do
+    local entry = fm.get_entry_on_line(0, lnum)
+    if entry and entry.name == entry_name then
+      local line = vim.api.nvim_buf_get_lines(0, lnum - 1, lnum, true)[1]
+      local id_str = line:match("^/(%d+)")
+      local col = line:find(entry_name, 1, true) or (id_str:len() + 1)
+      vim.api.nvim_win_set_cursor(0, { lnum, col - 1 })
+      M.set_last_cursor(bufname, nil)
+      break
+    end
+  end
+end
+
+---@param bufname string
+---@return nil|string
+M.get_last_cursor = function(bufname)
+  return last_cursor_entry[bufname]
+end
+
+local function are_any_modified()
+  local buffers = M.get_all_buffers()
+  for _, bufnr in ipairs(buffers) do
+    if vim.bo[bufnr].modified then
+      return true
+    end
+  end
+  return false
+end
+
+M.toggle_hidden = function()
+  local any_modified = are_any_modified()
+  if any_modified then
+    vim.notify("Cannot toggle hidden files when you have unsaved changes", vim.log.levels.WARN)
+  else
+    config.view_options.show_hidden = not config.view_options.show_hidden
+    M.rerender_all_fm_buffers({ refetch = false })
+  end
+end
+
+---@param is_hidden_file fun(filename: string, bufnr: nil|integer): boolean
+M.set_is_hidden_file = function(is_hidden_file)
+  local any_modified = are_any_modified()
+  if any_modified then
+    vim.notify("Cannot change is_hidden_file when you have unsaved changes", vim.log.levels.WARN)
+  else
+    config.view_options.is_hidden_file = is_hidden_file
+    M.rerender_all_fm_buffers({ refetch = false })
+  end
+end
+
+M.set_columns = function(cols)
+  local any_modified = are_any_modified()
+  if any_modified then
+    vim.notify("Cannot change columns when you have unsaved changes", vim.log.levels.WARN)
+  else
+    config.columns = cols
+    -- TODO only refetch if we don't have all the necessary data for the columns
+    M.rerender_all_fm_buffers({ refetch = true })
+  end
+end
+
+M.set_sort = function(new_sort)
+  local any_modified = are_any_modified()
+  if any_modified then
+    vim.notify("Cannot change sorting when you have unsaved changes", vim.log.levels.WARN)
+  else
+    config.view_options.sort = new_sort
+    -- TODO only refetch if we don't have all the necessary data for the columns
+    M.rerender_all_fm_buffers({ refetch = true })
+  end
+end
+
+-- List of bufnrs
+local session = {}
+
+---@return integer[]
+M.get_all_buffers = function()
+  return vim.tbl_filter(vim.api.nvim_buf_is_loaded, vim.tbl_keys(session))
+end
+
+local buffers_locked = false
+---Make all fm buffers nomodifiable
+M.lock_buffers = function()
+  buffers_locked = true
+  for bufnr in pairs(session) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      vim.bo[bufnr].modifiable = false
+    end
+  end
+end
+
+---Restore normal modifiable settings for fm buffers
+M.unlock_buffers = function()
+  buffers_locked = false
+  for bufnr in pairs(session) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local adapter = util.get_adapter(bufnr)
+      if adapter then
+        vim.bo[bufnr].modifiable = adapter.is_modifiable(bufnr)
+      end
+    end
+  end
+end
+
+---@param opts table
+---@note
+--- This DISCARDS ALL MODIFICATIONS a user has made to fm buffers
+M.rerender_all_fm_buffers = function(opts)
+  local buffers = M.get_all_buffers()
+  local hidden_buffers = {}
+  for _, bufnr in ipairs(buffers) do
+    hidden_buffers[bufnr] = true
+  end
+  for _, winid in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(winid) then
+      hidden_buffers[vim.api.nvim_win_get_buf(winid)] = nil
+    end
+  end
+  for _, bufnr in ipairs(buffers) do
+    if hidden_buffers[bufnr] then
+      vim.b[bufnr].fm_dirty = opts
+      -- We also need to mark this as nomodified so it doesn't interfere with quitting vim
+      vim.bo[bufnr].modified = false
+    else
+      M.render_buffer_async(bufnr, opts)
+    end
+  end
+end
+
+M.set_win_options = function()
+  local winid = vim.api.nvim_get_current_win()
+  for k, v in pairs(config.win_options) do
+    vim.api.nvim_set_option_value(k, v, { scope = "local", win = winid })
+  end
+end
+
+---Get a list of visible fm buffers and a list of hidden fm buffers
+---@note
+--- If any buffers are modified, return values are nil
+---@return nil|integer[]
+---@return nil|integer[]
+local function get_visible_hidden_buffers()
+  local buffers = M.get_all_buffers()
+  local hidden_buffers = {}
+  for _, bufnr in ipairs(buffers) do
+    if vim.bo[bufnr].modified then
+      return
+    end
+    hidden_buffers[bufnr] = true
+  end
+  for _, winid in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(winid) then
+      hidden_buffers[vim.api.nvim_win_get_buf(winid)] = nil
+    end
+  end
+  local visible_buffers = vim.tbl_filter(function(bufnr)
+    return not hidden_buffers[bufnr]
+  end, buffers)
+  return visible_buffers, vim.tbl_keys(hidden_buffers)
+end
+
+---Delete unmodified, hidden fm buffers and if none remain, clear the cache
+M.delete_hidden_buffers = function()
+  local visible_buffers, hidden_buffers = get_visible_hidden_buffers()
+  if not visible_buffers or not hidden_buffers or not vim.tbl_isempty(visible_buffers) then
+    return
+  end
+  for _, bufnr in ipairs(hidden_buffers) do
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end
+  cache.clear_everything()
+end
+
+---@param adapter fm.Adapter
+---@param ranges table<string, integer[]>
+---@return integer
+local function get_first_mutable_column_col(adapter, ranges)
+  local min_col = ranges.name[1]
+  for col_name, start_len in pairs(ranges) do
+    local start = start_len[1]
+    local col_spec = columns.get_column(adapter, col_name)
+    local is_col_mutable = col_spec and col_spec.perform_action ~= nil
+    if is_col_mutable and start < min_col then
+      min_col = start
+    end
+  end
+  return min_col
+end
+
+---@param bufnr integer
+M.initialize = function(bufnr)
+  if bufnr == 0 then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  vim.api.nvim_clear_autocmds({
+    buffer = bufnr,
+    group = "FM",
+  })
+  vim.bo[bufnr].buftype = "acwrite"
+  vim.bo[bufnr].syntax = "fm"
+  vim.bo[bufnr].filetype = "fm"
+  vim.b[bufnr].EditorConfig_disable = 1
+  session[bufnr] = true
+  for k, v in pairs(config.buf_options) do
+    vim.api.nvim_buf_set_option(bufnr, k, v)
+  end
+  M.set_win_options()
+  vim.api.nvim_create_autocmd("BufHidden", {
+    desc = "Delete fm buffers when no longer in use",
+    group = "FM",
+    nested = true,
+    buffer = bufnr,
+    callback = function()
+      -- First wait a short time (10ms) for the buffer change to settle
+      vim.defer_fn(function()
+        local visible_buffers = get_visible_hidden_buffers()
+        -- Only kick off the 2-second timer if we don't have any visible fm buffers
+        if visible_buffers and vim.tbl_isempty(visible_buffers) then
+          vim.defer_fn(function()
+            M.delete_hidden_buffers()
+          end, 2000)
+        end
+      end, 10)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufDelete", {
+    group = "FM",
+    nested = true,
+    once = true,
+    buffer = bufnr,
+    callback = function()
+      session[bufnr] = nil
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = "FM",
+    buffer = bufnr,
+    callback = function(args)
+      local opts = vim.b[args.buf].fm_dirty
+      if opts then
+        vim.b[args.buf].fm_dirty = nil
+        M.render_buffer_async(args.buf, opts)
+      end
+    end,
+  })
+  local timer
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    desc = "Update fm preview window",
+    group = "FM",
+    buffer = bufnr,
+    callback = function()
+      local fm = require("fm")
+      local parser = require("fm.mutator.parser")
+      if vim.wo.previewwindow then
+        return
+      end
+
+      -- Force the cursor to be after the (concealed) ID at the beginning of the line
+      local adapter = util.get_adapter(bufnr)
+      if adapter then
+        local cur = vim.api.nvim_win_get_cursor(0)
+        local line = vim.api.nvim_buf_get_lines(bufnr, cur[1] - 1, cur[1], true)[1]
+        local column_defs = columns.get_supported_columns(adapter)
+        local result = parser.parse_line(adapter, line, column_defs)
+        if result and result.ranges then
+          local min_col = get_first_mutable_column_col(adapter, result.ranges)
+          if cur[2] < min_col then
+            vim.api.nvim_win_set_cursor(0, { cur[1], min_col })
+          end
+        end
+      end
+
+      -- Debounce and update the preview window
+      if timer then
+        timer:again()
+        return
+      end
+      timer = vim.loop.new_timer()
+      if not timer then
+        return
+      end
+      timer:start(10, 100, function()
+        timer:stop()
+        timer:close()
+        timer = nil
+        vim.schedule(function()
+          if vim.api.nvim_get_current_buf() ~= bufnr then
+            return
+          end
+          local entry = fm.get_cursor_entry()
+          if entry then
+            local winid = util.get_preview_win()
+            if winid then
+              if entry.id ~= vim.w[winid].fm_entry_id then
+                fm.select({ preview = true })
+              end
+            end
+          end
+        end)
+      end)
+    end,
+  })
+  M.render_buffer_async(bufnr, {}, function(err)
+    if err then
+      vim.notify(
+        string.format("Error rendering fm buffer %s: %s", vim.api.nvim_buf_get_name(bufnr), err),
+        vim.log.levels.ERROR
+      )
+    else
+      vim.api.nvim_exec_autocmds(
+        "User",
+        { pattern = "FMEnter", modeline = false, data = { buf = bufnr } }
+      )
+    end
+  end)
+  keymap_util.set_keymaps(config.keymaps, bufnr)
+end
+
+---@param adapter fm.Adapter
+---@return fun(a: fm.InternalEntry, b: fm.InternalEntry): boolean
+local function get_sort_function(adapter)
+  local idx_funs = {}
+  for _, sort_pair in ipairs(config.view_options.sort) do
+    local col_name, order = unpack(sort_pair)
+    if order ~= "asc" and order ~= "desc" then
+      vim.notify_once(
+        string.format(
+          "Column '%s' has invalid sort order '%s'. Should be either 'asc' or 'desc'",
+          col_name,
+          order
+        ),
+        vim.log.levels.WARN
+      )
+    end
+    local col = columns.get_column(adapter, col_name)
+    if col and col.get_sort_value then
+      table.insert(idx_funs, { col.get_sort_value, order })
+    else
+      vim.notify_once(
+        string.format("Column '%s' does not support sorting", col_name),
+        vim.log.levels.WARN
+      )
+    end
+  end
+  return function(a, b)
+    for _, sort_fn in ipairs(idx_funs) do
+      local get_sort_value, order = unpack(sort_fn)
+      local a_val = get_sort_value(a)
+      local b_val = get_sort_value(b)
+      if a_val ~= b_val then
+        if order == "desc" then
+          return a_val > b_val
+        else
+          return a_val < b_val
+        end
+      end
+    end
+    return a[FIELD_NAME] < b[FIELD_NAME]
+  end
+end
+
+---@param bufnr integer
+---@param opts nil|table
+---    jump boolean
+---    jump_first boolean
+---@return boolean
+local function render_buffer(bufnr, opts)
+  if bufnr == 0 then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  opts = vim.tbl_extend("keep", opts or {}, {
+    jump = false,
+    jump_first = false,
+  })
+  local scheme = util.parse_url(bufname)
+  local adapter = util.get_adapter(bufnr)
+  if not scheme or not adapter then
+    return false
+  end
+  local entries = cache.list_url(bufname)
+  local entry_list = vim.tbl_values(entries)
+
+  table.sort(entry_list, get_sort_function(adapter))
+
+  local jump_idx
+  if opts.jump_first then
+    jump_idx = 1
+  end
+  local seek_after_render_found = false
+  local seek_after_render = M.get_last_cursor(bufname)
+  local column_defs = columns.get_supported_columns(scheme)
+  local line_table = {}
+  local col_width = {}
+  for i in ipairs(column_defs) do
+    col_width[i + 1] = 1
+  end
+  for _, entry in ipairs(entry_list) do
+    if not M.should_display(entry, bufnr) then
+      goto continue
+    end
+    local cols = M.format_entry_cols(entry, column_defs, col_width, adapter)
+    table.insert(line_table, cols)
+
+    local name = entry[FIELD_NAME]
+    if seek_after_render == name then
+      seek_after_render_found = true
+      jump_idx = #line_table
+      M.set_last_cursor(bufname, nil)
+    end
+    ::continue::
+  end
+
+  local lines, highlights = util.render_table(line_table, col_width)
+
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, true, lines)
+  vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].modified = false
+  util.set_highlights(bufnr, highlights)
+  if opts.jump then
+    -- TODO why is the schedule necessary?
+    vim.schedule(function()
+      for _, winid in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == bufnr then
+          -- If we're not jumping to a specific lnum, use the current lnum so we can adjust the col
+          local lnum = jump_idx or vim.api.nvim_win_get_cursor(winid)[1]
+          local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, true)[1]
+          local id_str = line:match("^/(%d+)")
+          local id = tonumber(id_str)
+          if id then
+            local entry = cache.get_entry_by_id(id)
+            if entry then
+              local name = entry[FIELD_NAME]
+              local col = line:find(name, 1, true) or (id_str:len() + 1)
+              vim.api.nvim_win_set_cursor(winid, { lnum, col - 1 })
+            end
+          end
+        end
+      end
+    end)
+  end
+  return seek_after_render_found
+end
+
+---@private
+---@param entry fm.InternalEntry
+---@param column_defs table[]
+---@param col_width integer[]
+---@param adapter fm.Adapter
+---@return fm.TextChunk[]
+M.format_entry_cols = function(entry, column_defs, col_width, adapter)
+  local name = entry[FIELD_NAME]
+  -- First put the unique ID
+  local cols = {}
+  local id_key = cache.format_id(entry[FIELD_ID])
+  col_width[1] = id_key:len()
+  table.insert(cols, id_key)
+  -- Then add all the configured columns
+  for i, column in ipairs(column_defs) do
+    local chunk = columns.render_col(adapter, column, entry)
+    local text = type(chunk) == "table" and chunk[1] or chunk
+    ---@cast text string
+    col_width[i + 1] = math.max(col_width[i + 1], vim.api.nvim_strwidth(text))
+    table.insert(cols, chunk)
+  end
+  -- Always add the entry name at the end
+  local entry_type = entry[FIELD_TYPE]
+  if entry_type == "directory" then
+    table.insert(cols, { name .. "/", "FMDir" })
+  elseif entry_type == "socket" then
+    table.insert(cols, { name, "FMSocket" })
+  elseif entry_type == "link" then
+    local meta = entry[FIELD_META]
+    local link_text
+    if meta then
+      if meta.link_stat and meta.link_stat.type == "directory" then
+        name = name .. "/"
+      end
+
+      if meta.link then
+        link_text = "->" .. " " .. meta.link
+        if meta.link_stat and meta.link_stat.type == "directory" then
+          link_text = util.addslash(link_text)
+        end
+      end
+    end
+
+    table.insert(cols, { name, "FMLink" })
+    if link_text then
+      table.insert(cols, { link_text, "Comment" })
+    end
+  else
+    table.insert(cols, { name, "FMFile" })
+  end
+  return cols
+end
+
+---Get the column names that are used for view and sort
+---@return string[]
+local function get_used_columns()
+  local cols = {}
+  for _, def in ipairs(config.columns) do
+    local name = util.split_config(def)
+    table.insert(cols, name)
+  end
+  for _, sort_pair in ipairs(config.view_options.sort) do
+    local name = sort_pair[1]
+    table.insert(cols, name)
+  end
+  return cols
+end
+
+---@param bufnr integer
+---@param opts nil|table
+---    preserve_undo nil|boolean
+---    refetch nil|boolean Defaults to true
+---@param callback nil|fun(err: nil|string)
+M.render_buffer_async = function(bufnr, opts, callback)
+  opts = vim.tbl_deep_extend("keep", opts or {}, {
+    preserve_undo = false,
+    refetch = true,
+  })
+  if bufnr == 0 then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  local scheme, dir = util.parse_url(bufname)
+  local preserve_undo = opts.preserve_undo and config.adapters[scheme] == "files"
+  if not preserve_undo then
+    -- Undo should not return to a blank buffer
+    -- Method taken from :h clear-undo
+    vim.bo[bufnr].undolevels = -1
+  end
+  local handle_error = vim.schedule_wrap(function(message)
+    if not preserve_undo then
+      vim.bo[bufnr].undolevels = vim.api.nvim_get_option_value("undolevels", { scope = "global" })
+    end
+    util.render_text(bufnr, { "Error: " .. message })
+    if callback then
+      callback(message)
+    else
+      error(message)
+    end
+  end)
+  if not dir then
+    handle_error(string.format("Could not parse fm url '%s'", bufname))
+    return
+  end
+  local adapter = util.get_adapter(bufnr)
+  if not adapter then
+    handle_error(string.format("[fm] no adapter for buffer '%s'", bufname))
+    return
+  end
+  local start_ms = vim.loop.hrtime() / 1e6
+  local seek_after_render_found = false
+  local first = true
+  vim.bo[bufnr].modifiable = false
+  loading.set_loading(bufnr, true)
+
+  local finish = vim.schedule_wrap(function()
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+    loading.set_loading(bufnr, false)
+    render_buffer(bufnr, { jump = true })
+    if not preserve_undo then
+      vim.bo[bufnr].undolevels = vim.api.nvim_get_option_value("undolevels", { scope = "global" })
+    end
+    vim.bo[bufnr].modifiable = not buffers_locked and adapter.is_modifiable(bufnr)
+    if callback then
+      callback()
+    end
+  end)
+  if not opts.refetch then
+    finish()
+    return
+  end
+
+  cache.begin_update_url(bufname)
+  adapter.list(bufname, get_used_columns(), function(err, entries, fetch_more)
+    loading.set_loading(bufnr, false)
+    if err then
+      cache.end_update_url(bufname)
+      handle_error(err)
+      return
+    end
+    if entries then
+      for _, entry in ipairs(entries) do
+        cache.store_entry(bufname, entry)
+      end
+    end
+    if fetch_more then
+      local now = vim.loop.hrtime() / 1e6
+      local delta = now - start_ms
+      -- If we've been chugging for more than 40ms, go ahead and render what we have
+      if delta > 40 then
+        start_ms = now
+        vim.schedule(function()
+          seek_after_render_found =
+            render_buffer(bufnr, { jump = not seek_after_render_found, jump_first = first })
+        end)
+      end
+      first = false
+      vim.defer_fn(fetch_more, 4)
+    else
+      cache.end_update_url(bufname)
+      -- done iterating
+      finish()
+    end
+  end)
+end
+
+return M

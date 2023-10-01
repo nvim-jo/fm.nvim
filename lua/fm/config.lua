@@ -1,66 +1,4 @@
-# fm.nvim
-
-A [vim-vinegar](https://github.com/tpope/vim-vinegar) like file explorer that lets you edit your filesystem like a normal Neovim buffer.
-
-Fork from [oil.nvim](https://github.com/stevearc/oil.nvim/)
-
-## Requirements
-
-- Neovim 0.8+
-- (optional) [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) for file icons
-
-## Installation
-
-fm.nvim supports all the usual plugin managers
-
-<details>
-  <summary>lazy.nvim</summary>
-
-```lua
-{
-  'nvim-jo/fm.nvim',
-  opts = {},
-  -- Optional dependencies
-  dependencies = { "nvim-tree/nvim-web-devicons" },
-}
-```
-
-</details>
-
-<details>
-  <summary>Packer</summary>
-
-```lua
-require('packer').startup(function()
-    use {
-      'nvim-jo/fm.nvim',
-      config = function() require('fm').setup() end
-    }
-end)
-```
-
-## Quick start
-
-Add the following to your init.lua
-
-```lua
-require("fm").setup()
-```
-
-Then open a directory with `nvim .`. Use `<CR>` to open a file/directory, and `-` to go up a directory. Otherwise, just treat it like a normal buffer and make changes as you like. Remember to `:w` when you're done to actually perform the actions.
-
-If you want to mimic the `vim-vinegar` method of navigating to the parent directory of a file, add this keymap:
-
-```lua
-vim.keymap.set("n", "-", "<CMD>FM<CR>", { desc = "Open parent directory" })
-```
-
-You can open a directory with `:edit <path>` or `:FM <path>`. To open fm in a floating window, do `:FM --float <path>`.
-
-## Options
-
-```lua
-require("fm").setup({
+local default_config = {
   -- FM will take over directory buffers (e.g. `vim .` or `:e src/`)
   -- Set to false if you still want to use netrw.
   default_file_explorer = true,
@@ -192,5 +130,130 @@ require("fm").setup({
       winblend = 0,
     },
   },
-})
-```
+}
+
+-- The adapter API hasn't really stabilized yet. We're not ready to advertise or encourage people to
+-- write their own adapters, and so there's no real reason to edit these config options. For that
+-- reason, I'm taking them out of the section above so they won't show up in the autogen docs.
+default_config.adapters = {
+  ["fm://"] = "files",
+  ["fm-ssh://"] = "ssh",
+}
+default_config.adapter_aliases = {}
+
+local M = {}
+
+M.setup = function(opts)
+  local new_conf = vim.tbl_deep_extend("keep", opts or {}, default_config)
+  if not new_conf.use_default_keymaps then
+    new_conf.keymaps = opts.keymaps or {}
+  end
+
+  if new_conf.delete_to_trash then
+    local trash_bin = vim.split(new_conf.trash_command, " ")[1]
+    if vim.fn.executable(trash_bin) == 0 then
+      vim.notify(
+        string.format(
+          "fm.nvim: delete_to_trash is true, but '%s' executable not found.\nDeleted files will be permanently removed.",
+          new_conf.trash_command
+        ),
+        vim.log.levels.WARN
+      )
+      new_conf.delete_to_trash = false
+    end
+  end
+
+  for k, v in pairs(new_conf) do
+    M[k] = v
+  end
+
+  M.adapter_to_scheme = {}
+  for k, v in pairs(M.adapters) do
+    M.adapter_to_scheme[v] = k
+  end
+  M._adapter_by_scheme = {}
+  if type(M.trash) == "string" then
+    M.trash = vim.fn.fnamemodify(vim.fn.expand(M.trash), ":p")
+  end
+end
+
+---@return nil|string
+M.get_trash_url = function()
+  if not M.trash then
+    return nil
+  end
+  local fs = require("fm.fs")
+  if M.trash == true then
+    local data_home = os.getenv("XDG_DATA_HOME") or vim.fn.expand("~/.local/share")
+    local preferred = fs.join(data_home, "trash")
+    local candidates = {
+      preferred,
+    }
+    if fs.is_windows then
+      -- TODO permission issues when using the recycle bin. The folder gets created without
+      -- read/write perms, so all operations fail
+      -- local cwd = vim.fn.getcwd()
+      -- table.insert(candidates, 1, cwd:sub(1, 3) .. "$Recycle.Bin")
+      -- table.insert(candidates, 1, "C:\\$Recycle.Bin")
+    else
+      table.insert(candidates, fs.join(data_home, "Trash", "files"))
+      table.insert(candidates, fs.join(os.getenv("HOME"), ".Trash"))
+    end
+    local trash_dir = preferred
+    for _, candidate in ipairs(candidates) do
+      if vim.fn.isdirectory(candidate) == 1 then
+        trash_dir = candidate
+        break
+      end
+    end
+
+    local fm_trash_dir = vim.fn.fnamemodify(fs.join(trash_dir, "nvim", "fm"), ":p")
+    fs.mkdirp(fm_trash_dir)
+    M.trash = fm_trash_dir
+  end
+  return M.adapter_to_scheme.files .. fs.os_to_posix_path(M.trash)
+end
+
+---@param scheme nil|string
+---@return nil|fm.Adapter
+M.get_adapter_by_scheme = function(scheme)
+  if not scheme then
+    return nil
+  end
+  if not vim.endswith(scheme, "://") then
+    local pieces = vim.split(scheme, "://", { plain = true })
+    if #pieces <= 2 then
+      scheme = pieces[1] .. "://"
+    else
+      error(string.format("Malformed url: '%s'", scheme))
+    end
+  end
+  local adapter = M._adapter_by_scheme[scheme]
+  if adapter == nil then
+    local name = M.adapters[scheme]
+    if not name then
+      vim.notify(
+        string.format("Could not find fm adapter for scheme '%s'", scheme),
+        vim.log.levels.ERROR
+      )
+      return nil
+    end
+    local ok
+    ok, adapter = pcall(require, string.format("fm.adapters.%s", name))
+    if ok then
+      adapter.name = name
+      M._adapter_by_scheme[scheme] = adapter
+    else
+      M._adapter_by_scheme[scheme] = false
+      adapter = false
+      vim.notify(string.format("Could not find fm adapter '%s'", name), vim.log.levels.ERROR)
+    end
+  end
+  if adapter then
+    return adapter
+  else
+    return nil
+  end
+end
+
+return M
