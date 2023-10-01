@@ -717,7 +717,7 @@ local function set_colors()
     vim.api.nvim_set_hl(
       0,
       "FloatTitle",
-      { fg = "#CDD6F4", bg = border.background or normal.background }
+      { fg = normal.foreground, bg = border.background or normal.background }
     )
   end
 end
